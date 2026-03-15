@@ -7,6 +7,7 @@ from pgvector.psycopg2 import register_vector
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
@@ -16,6 +17,12 @@ load_dotenv()
 app = FastAPI(
     title="RAG 知识库 API",
     version="0.2.0"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # 允许前端访问
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
