@@ -1,0 +1,13 @@
+# 忽略虚拟环境文件夹和编译后的Python文件
+venv/
+__pycache__/
+*.pyc
+
+# 密钥文件（绝对不能上传）
+.env
+
+# 操作系统文件
+.DS_Store
+
+# IDE 配置文件
+.vscode/settings.json
