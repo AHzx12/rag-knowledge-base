@@ -16,14 +16,8 @@ type PreviewDoc = { filename: string; chunks: { id: number; content: string; cre
 type Tab = "chat" | "graph";
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>(() => {
-    if (typeof window === "undefined") return [];
-    try {
-      const saved = localStorage.getItem("rag-chat-history");
-      return saved ? JSON.parse(saved) : [];
-    } catch { return []; }
-  });
-
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [lang, setLang] = useState<"zh" | "en">("zh");
@@ -40,10 +34,20 @@ export default function Home() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // 客户端挂载后才读取 localStorage，避免 hydration 不一致
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    try {
+      const saved = localStorage.getItem("rag-chat-history");
+      if (saved) setMessages(JSON.parse(saved));
+    } catch {}
+    setHydrated(true);
+  }, []);
+
+  // hydrated 之后才保存，避免空数组覆盖历史
+  useEffect(() => {
+    if (!hydrated) return;
     localStorage.setItem("rag-chat-history", JSON.stringify(messages));
-  }, [messages]);
+  }, [messages, hydrated]);
 
   const fetchDocuments = useCallback(async () => {
     try {
@@ -190,7 +194,6 @@ export default function Home() {
 
       {/* ── 左侧边栏 ── */}
       <aside className="w-60 bg-[#18181b] flex flex-col shrink-0 border-r border-[#27272a]">
-        {/* Logo */}
         <div className="px-4 py-5 border-b border-[#27272a]">
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
@@ -205,7 +208,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 知识库状态 + 文档列表切换 */}
+        {/* 状态 */}
         <div className="px-3 py-3 border-b border-[#27272a]">
           <div className="bg-[#27272a] rounded-xl px-3 py-2.5">
             <div className="flex items-center justify-between mb-2">
@@ -217,8 +220,7 @@ export default function Home() {
             </div>
             <div className="flex items-center justify-between">
               <span className="text-white text-xs">{t.docChunks(docCount)}</span>
-              <button
-                onClick={() => setShowDocs(v => !v)}
+              <button onClick={() => setShowDocs(v => !v)}
                 className={`text-xs px-2 py-0.5 rounded-md transition-colors ${
                   showDocs ? "bg-blue-600 text-white" : "text-[#71717a] hover:text-white hover:bg-[#3f3f46]"
                 }`}>
@@ -250,32 +252,25 @@ export default function Home() {
                         <p className="text-[#71717a] text-xs mt-0.5">{doc.chunks} {t.chunks}</p>
                       </div>
                     </div>
-
-                    {/* hover 才显示的操作按钮 */}
                     <div className="flex items-center gap-1.5 mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button
-                        onClick={() => openPreview(doc.filename)}
+                      <button onClick={() => openPreview(doc.filename)}
                         className="flex-1 text-xs text-blue-400 hover:text-blue-300 bg-[#1c1c1e] rounded-md py-1 transition-colors text-center">
                         {t.preview}
                       </button>
-
                       {confirmDelete === doc.filename ? (
                         <div className="flex gap-1 flex-1">
-                          <button
-                            onClick={() => deleteDocument(doc.filename)}
+                          <button onClick={() => deleteDocument(doc.filename)}
                             disabled={deletingFile === doc.filename}
                             className="flex-1 text-xs text-red-400 bg-red-950 rounded-md py-1 transition-colors text-center disabled:opacity-50">
                             {deletingFile === doc.filename ? t.deleting : t.deleteYes}
                           </button>
-                          <button
-                            onClick={() => setConfirmDelete(null)}
+                          <button onClick={() => setConfirmDelete(null)}
                             className="flex-1 text-xs text-[#71717a] hover:text-white bg-[#1c1c1e] rounded-md py-1 transition-colors text-center">
                             {t.deleteNo}
                           </button>
                         </div>
                       ) : (
-                        <button
-                          onClick={() => setConfirmDelete(doc.filename)}
+                        <button onClick={() => setConfirmDelete(doc.filename)}
                           className="flex-1 text-xs text-[#71717a] hover:text-red-400 bg-[#1c1c1e] rounded-md py-1 transition-colors text-center">
                           {t.deleteConfirm}
                         </button>
@@ -288,7 +283,7 @@ export default function Home() {
           </div>
         )}
 
-        {/* 上传区 */}
+        {/* 上传 */}
         <div className="px-3 py-3 border-b border-[#27272a]">
           <label className="flex flex-col items-center gap-2 cursor-pointer border border-dashed border-[#3f3f46] hover:border-blue-500 rounded-xl p-4 transition-colors group">
             <div className="w-8 h-8 bg-[#27272a] group-hover:bg-blue-950 rounded-lg flex items-center justify-center transition-colors">
@@ -304,7 +299,6 @@ export default function Home() {
             </span>
             <input type="file" accept=".txt,.pdf" onChange={uploadFile} className="hidden"/>
           </label>
-
           {uploadStatus.text && (
             <div className={`mt-2 text-xs rounded-lg px-3 py-2 leading-relaxed ${
               uploadStatus.type === "success" ? "bg-emerald-950 text-emerald-400 border border-emerald-900" :
@@ -326,7 +320,6 @@ export default function Home() {
 
       {/* ── 主区域 ── */}
       <main className="flex-1 flex flex-col min-w-0">
-        {/* 顶栏 */}
         <header className="h-14 bg-white border-b border-gray-200 px-5 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-0.5">
             {(["chat", "graph"] as Tab[]).map(tabId => (
@@ -360,7 +353,6 @@ export default function Home() {
                 </svg>
               </button>
             )}
-
             <div className="flex items-center bg-gray-100 rounded-lg p-0.5">
               {(["zh", "en"] as const).map(l => (
                 <button key={l} onClick={() => setLang(l)}
@@ -371,7 +363,6 @@ export default function Home() {
                 </button>
               ))}
             </div>
-
             <div className="flex items-center gap-1.5 text-xs text-gray-400">
               <div className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"/>
               {t.status}
@@ -379,16 +370,12 @@ export default function Home() {
           </div>
         </header>
 
-        {/* 图谱 Tab */}
         {tab === "graph" && (
           <div className="flex-1 overflow-hidden"><GraphView lang={lang}/></div>
         )}
 
-        {/* 对话 Tab */}
         {tab === "chat" && (
           <div className="flex-1 flex overflow-hidden">
-
-            {/* 聊天区 */}
             <div className={`flex flex-col overflow-hidden transition-all duration-300 ${showPreviewPanel ? "w-1/2" : "w-full"}`}>
               <div className="flex-1 overflow-y-auto">
                 {messages.length === 0 ? (
@@ -444,7 +431,6 @@ export default function Home() {
                         </div>
                       </div>
                     ))}
-
                     {loading && (
                       <div className="flex gap-3">
                         <div className="w-8 h-8 rounded-full bg-gray-900 shrink-0 flex items-center justify-center text-xs font-bold text-white">AI</div>
@@ -462,7 +448,6 @@ export default function Home() {
                 )}
               </div>
 
-              {/* 输入框 */}
               <div className="bg-white border-t border-gray-100 px-6 py-4 shrink-0">
                 <div className="max-w-2xl mx-auto flex gap-3 items-end">
                   <div className="flex-1 bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3 focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-50 transition-all">

@@ -12,7 +12,8 @@ import json
 import shutil
 from pathlib import Path
 from fastapi import File, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from fastapi import Request
 
 
 # 创建文件存储目录
@@ -486,13 +487,18 @@ async def upload_file(file: UploadFile = File(...)):
         "graph_relations": r_total,
         "has_original": True
     }    
-
-@app.get("/files/{filename}")
-def get_file(filename: str):
-    """返回原始文件供前端预览"""
+    
+@app.api_route("/files/{filename}", methods=["GET", "HEAD"])
+def get_file(filename: str, request: Request):
+    """返回原始文件供前端预览，同时支持 HEAD 检查文件是否存在"""
     file_path = UPLOAD_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="原始文件不存在")
+    
+    # HEAD 请求只检查文件是否存在，不返回内容
+    from fastapi import Request
+    if request.method == "HEAD":
+        return Response(status_code=200)
     
     media_type = "application/pdf" if filename.endswith(".pdf") else "text/plain"
     return FileResponse(path=str(file_path), media_type=media_type)
