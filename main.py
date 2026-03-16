@@ -162,3 +162,45 @@ def upload(doc: DocumentIn):
         "message": f"已将 {doc.filename} 存入知识库",
         "char_count": len(doc.content)
     }
+    
+@app.get("/documents")
+def list_documents():
+    cur.execute("""
+        SELECT filename, COUNT(*) as chunks, MAX(created_at) as uploaded_at
+        FROM documents
+        GROUP BY filename
+        ORDER BY MAX(created_at) DESC
+    """)
+    rows = cur.fetchall()
+    return {
+        "documents": [
+            {
+                "filename": row[0],
+                "chunks": row[1],
+                "uploaded_at": row[2].strftime("%Y-%m-%d %H:%M") if row[2] else None
+            }
+            for row in rows
+        ],
+        "total_files": len(rows)
+    }
+    
+@app.get("/documents/{filename}")
+def get_document(filename: str):
+    """返回某个文档的所有文本块"""
+    cur.execute("""
+        SELECT id, content, created_at
+        FROM documents
+        WHERE filename = %s
+        ORDER BY id ASC
+    """, (filename,))
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return {
+        "filename": filename,
+        "chunks": [
+            {"id": r[0], "content": r[1], "created_at": r[2].strftime("%Y-%m-%d %H:%M")}
+            for r in rows
+        ],
+        "total_chunks": len(rows)
+    }

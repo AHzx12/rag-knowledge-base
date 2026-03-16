@@ -65,7 +65,7 @@ def generate(question: str, context_chunks: list[dict]) -> str:
 
 用户问题：{question}
 
-请用中文回答："""
+请用与用户提问相同的语言回答。如果用户用中文提问，用中文回答；如果用英文提问，用英文回答："""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",   # 便宜但够用
