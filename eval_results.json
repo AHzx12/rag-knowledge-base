@@ -1,0 +1,9 @@
+{
+  "scores": {
+    "答案忠实度   Faithfulness": 1.0,
+    "答案相关性   Answer Relevancy": 0.688,
+    "检索精确率   Context Precision": 0.8,
+    "检索召回率   Context Recall": 0.8
+  },
+  "questions_tested": 5
+}

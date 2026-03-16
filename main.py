@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile
 from pydantic import BaseModel
 from typing import Optional
 import os
@@ -11,9 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import json
 import shutil
 from pathlib import Path
-from fastapi import File, UploadFile
 from fastapi.responses import FileResponse, Response
-from fastapi import Request
+from rank_bm25 import BM25Okapi
+import re
 
 
 # 创建文件存储目录
@@ -164,8 +164,8 @@ def ask_with_graph(question: str, top_k: int = 3) -> dict:
     """完整 GraphRAG 流程"""
 
     # 第一步：向量检索
-    chunks = retrieve(question, top_k)
-    relevant = [c for c in chunks if c["similarity"] > 0.3]
+    chunks = hybrid_retrieve(question, top_k)
+    relevant = [c for c in chunks if c.get("similarity", 1.0) > 0.2 or c.get("rrf_score", 0) > 0]
 
     # 第二步：图谱查询
     entities = extract_entities_from_question(question)
@@ -286,6 +286,91 @@ def delete_document(filename: str):
         "message": f"已删除 {filename}",
         "deleted_chunks": count
     }
+
+def tokenize(text: str) -> list[str]:
+    """简单分词：按空格和标点切分，同时保留中文字符"""
+    # 英文按空格切，中文按字切
+    tokens = re.findall(r'[\u4e00-\u9fff]|[a-zA-Z0-9]+', text.lower())
+    return tokens
+
+
+def bm25_search(question: str, top_k: int = 10) -> list[dict]:
+    """BM25 关键词检索"""
+    # 取出所有文档块
+    cur.execute("SELECT id, content, filename FROM documents")
+    rows = cur.fetchall()
+    if not rows:
+        return []
+
+    ids = [r[0] for r in rows]
+    contents = [r[1] for r in rows]
+    filenames = [r[2] for r in rows]
+
+    # 构建 BM25 索引
+    tokenized_corpus = [tokenize(c) for c in contents]
+    bm25 = BM25Okapi(tokenized_corpus)
+
+    # 查询
+    query_tokens = tokenize(question)
+    scores = bm25.get_scores(query_tokens)
+
+    # 取 Top K
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+
+    return [
+        {
+            "id": ids[i],
+            "content": contents[i],
+            "filename": filenames[i],
+            "bm25_score": float(scores[i])
+        }
+        for i in top_indices
+        if scores[i] > 0  # 过滤掉完全不相关的
+    ]
+
+
+def hybrid_retrieve(question: str, top_k: int = 5) -> list[dict]:
+    """
+    Hybrid Search：向量检索 + BM25，用 RRF 算法融合排名
+    """
+    # 向量检索（取更多候选，之后再筛选）
+    vector_results = retrieve(question, top_k=10)
+
+    # BM25 检索
+    bm25_results = bm25_search(question, top_k=10)
+
+    # RRF 融合
+    # 用 content 作为文档唯一标识符
+    rrf_scores: dict[str, float] = {}
+    content_map: dict[str, dict] = {}
+
+    # 向量检索结果的 RRF 分数
+    for rank, doc in enumerate(vector_results):
+        key = doc["content"][:100]  # 用前100字作为 key
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (rank + 60)
+        content_map[key] = doc
+
+    # BM25 结果的 RRF 分数
+    for rank, doc in enumerate(bm25_results):
+        key = doc["content"][:100]
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (rank + 60)
+        if key not in content_map:
+            content_map[key] = {
+                "content": doc["content"],
+                "filename": doc["filename"],
+                "similarity": 0.0
+            }
+
+    # 按 RRF 分数排序，取 Top K
+    sorted_keys = sorted(rrf_scores, key=lambda k: rrf_scores[k], reverse=True)[:top_k]
+
+    results = []
+    for key in sorted_keys:
+        doc = content_map[key].copy()
+        doc["rrf_score"] = round(rrf_scores[key], 6)
+        results.append(doc)
+
+    return results
     
 # ========================
 # API 路由
@@ -502,3 +587,61 @@ def get_file(filename: str, request: Request):
     
     media_type = "application/pdf" if filename.endswith(".pdf") else "text/plain"
     return FileResponse(path=str(file_path), media_type=media_type)
+
+# ========================
+# eval 测试函数API
+# ========================
+
+@app.post("/evaluate")
+def run_eval(questions: list[dict]):
+    """
+    触发 RAG 评估
+    传入格式：[{"question": "...", "ground_truth": "..."}]
+    """
+    if not questions:
+        raise HTTPException(status_code=400, detail="至少提供一个测试问题")
+    if len(questions) > 20:
+        raise HTTPException(status_code=400, detail="最多 20 个问题")
+
+    results = []
+    for item in questions:
+        q = item.get("question", "")
+        if not q:
+            continue
+
+        # 检索
+        q_embedding = get_embedding(q)
+        cur.execute("""
+            SELECT content, filename,
+                   1 - (embedding <=> %s::vector) AS similarity
+            FROM documents
+            ORDER BY embedding <=> %s::vector
+            LIMIT 3
+        """, (q_embedding, q_embedding))
+        rows = cur.fetchall()
+        contexts = [r[0] for r in rows]
+        sources = list(set(r[1] for r in rows))
+
+        # 生成答案
+        if contexts:
+            context_text = "\n\n".join(contexts)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": f"""根据以下文档回答问题，不要编造：
+{context_text}
+问题：{q}"""}],
+                temperature=0.1
+            )
+            answer = response.choices[0].message.content
+        else:
+            answer = "知识库中没有找到相关信息。"
+
+        results.append({
+            "question": q,
+            "answer": answer,
+            "contexts": contexts,
+            "sources": sources,
+            "ground_truth": item.get("ground_truth", ""),
+        })
+
+    return {"results": results, "count": len(results)}
