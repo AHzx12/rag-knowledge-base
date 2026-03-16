@@ -8,6 +8,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import time
 from fastapi.middleware.cors import CORSMiddleware
+import json
 
 load_dotenv()
 
@@ -51,16 +52,18 @@ class DocumentIn(BaseModel):
     filename: str
 
 # ========================
-# RAG 核心函数
+# RAG 核心函数（GraphRAG 版）
 # ========================
+
 def get_embedding(text: str) -> list:
     response = client.embeddings.create(
-        input=text,
-        model="text-embedding-3-small"
+        input=text, model="text-embedding-3-small"
     )
     return response.data[0].embedding
 
+
 def retrieve(question: str, top_k: int = 3) -> list[dict]:
+    """向量检索"""
     q_embedding = get_embedding(question)
     cur.execute("""
         SELECT content, filename,
@@ -74,24 +77,134 @@ def retrieve(question: str, top_k: int = 3) -> list[dict]:
         for r in cur.fetchall()
     ]
 
-def generate(question: str, chunks: list[dict]) -> str:
-    context = "\n\n".join([
+
+def extract_entities_from_question(question: str) -> list[str]:
+    """从用户问题里提取关键实体，用于图谱查询"""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""从以下问题中提取 1-3 个最重要的实体名词。
+只返回 JSON 数组，例如：["Python", "函数"]
+不要其他文字。
+
+问题：{question}"""}],
+        temperature=0
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        return json.loads(raw.strip())
+    except Exception:
+        return []
+
+
+def query_graph(entity_name: str, depth: int = 2) -> list[dict]:
+    """图谱遍历：从实体出发，找关联的所有关系"""
+    cur.execute("""
+        WITH RECURSIVE graph_traverse AS (
+            SELECT source_entity, relation, target_entity, 1 AS depth
+            FROM relationships
+            WHERE source_entity ILIKE %s OR target_entity ILIKE %s
+            UNION
+            SELECT r.source_entity, r.relation, r.target_entity, gt.depth + 1
+            FROM relationships r
+            JOIN graph_traverse gt
+              ON r.source_entity = gt.target_entity
+             AND gt.depth < %s
+        )
+        SELECT DISTINCT source_entity, relation, target_entity
+        FROM graph_traverse
+        LIMIT 20
+    """, (f"%{entity_name}%", f"%{entity_name}%", depth))
+    return [
+        {"source": row[0], "relation": row[1], "target": row[2]}
+        for row in cur.fetchall()
+    ]
+
+
+def generate(question: str, chunks: list[dict], graph_context: str = "") -> str:
+    """LLM 生成答案，同时接受向量检索结果和图谱上下文"""
+    vector_context = "\n\n".join([
         f"[来源: {c['filename']}]\n{c['content']}"
         for c in chunks
     ])
+
+    graph_section = ""
+    if graph_context:
+        graph_section = f"\n\n知识图谱关联信息：\n{graph_context}"
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": f"""你是知识库助手。只根据以下文档内容回答问题，不要编造信息。
-如果文档中没有相关信息，请明确说明。
+        messages=[{"role": "user", "content": f"""你是知识库助手。根据以下信息回答问题。
+只使用提供的内容回答，不要编造信息。
+用与用户提问相同的语言回答。
 
 文档内容：
-{context}
+{vector_context}{graph_section}
 
 问题：{question}"""}],
         temperature=0.1
     )
     return response.choices[0].message.content
 
+
+def ask_with_graph(question: str, top_k: int = 3) -> dict:
+    """完整 GraphRAG 流程"""
+
+    # 第一步：向量检索
+    chunks = retrieve(question, top_k)
+    relevant = [c for c in chunks if c["similarity"] > 0.3]
+
+    # 第二步：图谱查询
+    entities = extract_entities_from_question(question)
+    graph_triples = []
+    for entity in entities:
+        triples = query_graph(entity)
+        graph_triples.extend(triples)
+
+    # 去重
+    seen = set()
+    unique_triples = []
+    for t in graph_triples:
+        key = f"{t['source']}-{t['relation']}-{t['target']}"
+        if key not in seen:
+            seen.add(key)
+            unique_triples.append(t)
+
+    # 把图谱三元组转成文字
+    graph_context = ""
+    if unique_triples:
+        graph_context = "\n".join([
+            f"{t['source']} --{t['relation']}--> {t['target']}"
+            for t in unique_triples
+        ])
+
+    # 没有任何相关内容
+    if not relevant and not unique_triples:
+        return {
+            "question": question,
+            "answer": "抱歉，知识库中没有找到相关信息。",
+            "sources": [],
+            "chunks_found": 0,
+            "graph_triples": [],
+            "entities_found": entities
+        }
+
+    # 第三步：生成答案
+    answer = generate(question, relevant, graph_context)
+    sources = list(set([c["filename"] for c in relevant]))
+
+    return {
+        "question": question,
+        "answer": answer,
+        "sources": sources,
+        "chunks_found": len(relevant),
+        "graph_triples": unique_triples,
+        "entities_found": entities
+    }
+    
 # ========================
 # API 路由
 # ========================
@@ -110,37 +223,19 @@ def health():
 
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest):
-    """核心问答接口：输入问题，返回基于知识库的答案"""
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
     if len(request.question) > 500:
         raise HTTPException(status_code=400, detail="问题不能超过500字")
 
     start = time.time()
-
-    # 检索
-    chunks = retrieve(request.question, request.top_k)
-    relevant = [c for c in chunks if c["similarity"] > 0.3]
-
-    # 没找到相关文档
-    if not relevant:
-        return AskResponse(
-            question=request.question,
-            answer="抱歉，知识库中没有找到相关信息。",
-            sources=[],
-            chunks_found=0,
-            time_taken=round(time.time() - start, 3)
-        )
-
-    # 生成答案
-    answer = generate(request.question, relevant)
-    sources = list(set([c["filename"] for c in relevant]))
+    result = ask_with_graph(request.question, request.top_k)
 
     return AskResponse(
-        question=request.question,
-        answer=answer,
-        sources=sources,
-        chunks_found=len(relevant),
+        question=result["question"],
+        answer=result["answer"],
+        sources=result["sources"],
+        chunks_found=result["chunks_found"],
         time_taken=round(time.time() - start, 3)
     )
 
@@ -203,4 +298,22 @@ def get_document(filename: str):
             for r in rows
         ],
         "total_chunks": len(rows)
+    }
+    
+@app.get("/graph/{entity}")
+def get_graph(entity: str):
+    """返回某个实体的图谱关系，供前端可视化"""
+    triples = query_graph(entity, depth=2)
+    
+    # 整理成节点+边的格式
+    nodes = set()
+    for t in triples:
+        nodes.add(t["source"])
+        nodes.add(t["target"])
+
+    return {
+        "entity": entity,
+        "nodes": [{"id": n, "label": n} for n in nodes],
+        "edges": triples,
+        "total": len(triples)
     }
