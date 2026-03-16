@@ -204,6 +204,60 @@ def ask_with_graph(question: str, top_k: int = 3) -> dict:
         "graph_triples": unique_triples,
         "entities_found": entities
     }
+
+def extract_entities_and_relations(text: str, filename: str) -> dict:
+    """用 LLM 从文本提取实体和关系"""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"""从以下文本中提取实体和关系。
+实体类型：人物、地点、概念、技术、组织
+只提取文本中明确提到的，用简短动词表示关系。
+
+文本：{text}
+
+返回 JSON 格式：
+{{"entities": [{{"name": "名称", "type": "类型", "description": "描述"}}],
+  "relationships": [{{"source": "实体A", "relation": "关系", "target": "实体B"}}]}}
+
+只返回 JSON。"""}],
+        temperature=0
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+def store_graph_data(data: dict, filename: str) -> tuple[int, int]:
+    """把实体和关系存入数据库，返回存入数量"""
+    e_count = 0
+    for e in data.get("entities", []):
+        try:
+            cur.execute("""
+                INSERT INTO entities (name, type, description, source_filename)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (name, source_filename) DO UPDATE
+                SET description = EXCLUDED.description
+            """, (e["name"], e.get("type",""), e.get("description",""), filename))
+            e_count += 1
+        except Exception:
+            pass
+
+    r_count = 0
+    for r in data.get("relationships", []):
+        try:
+            cur.execute("""
+                INSERT INTO relationships (source_entity, relation, target_entity, source_filename)
+                VALUES (%s, %s, %s, %s)
+            """, (r["source"], r["relation"], r["target"], filename))
+            r_count += 1
+        except Exception:
+            pass
+
+    conn.commit()
+    return e_count, r_count
     
 # ========================
 # API 路由
@@ -241,21 +295,45 @@ def ask(request: AskRequest):
 
 @app.post("/upload")
 def upload(doc: DocumentIn):
-    """上传新文档到知识库"""
     if not doc.content.strip():
         raise HTTPException(status_code=400, detail="文档内容不能为空")
 
-    embedding = get_embedding(doc.content)
-    cur.execute(
-        "INSERT INTO documents (content, embedding, filename) VALUES (%s, %s, %s)",
-        (doc.content, embedding, doc.filename)
+    # 第一步：切块 + 向量化存入数据库
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", "。", "！", "？", " ", ""]
     )
+    chunks = splitter.split_text(doc.content)
+    chunks = [c for c in chunks if c.strip()]
+
+    for chunk in chunks:
+        embedding = get_embedding(chunk)
+        cur.execute(
+            "INSERT INTO documents (content, embedding, filename) VALUES (%s, %s, %s)",
+            (chunk, embedding, doc.filename)
+        )
     conn.commit()
+
+    # 第二步：自动提取实体和关系，构建图谱
+    graph_entities = 0
+    graph_relations = 0
+    for chunk in chunks:
+        try:
+            data = extract_entities_and_relations(chunk, doc.filename)
+            e, r = store_graph_data(data, doc.filename)
+            graph_entities += e
+            graph_relations += r
+        except Exception as ex:
+            print(f"图谱提取失败（跳过）：{ex}")
 
     return {
         "status": "success",
         "message": f"已将 {doc.filename} 存入知识库",
-        "char_count": len(doc.content)
+        "chunks_stored": len(chunks),
+        "graph_entities": graph_entities,
+        "graph_relations": graph_relations
     }
     
 @app.get("/documents")
