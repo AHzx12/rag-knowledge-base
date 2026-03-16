@@ -9,6 +9,15 @@ from dotenv import load_dotenv
 import time
 from fastapi.middleware.cors import CORSMiddleware
 import json
+import shutil
+from pathlib import Path
+from fastapi import File, UploadFile
+from fastapi.responses import FileResponse
+
+
+# 创建文件存储目录
+UPLOAD_DIR = Path("uploaded_files")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 load_dotenv()
 
@@ -206,27 +215,26 @@ def ask_with_graph(question: str, top_k: int = 3) -> dict:
     }
 
 def extract_entities_and_relations(text: str, filename: str) -> dict:
-    """用 LLM 从文本提取实体和关系"""
+    """用 LLM 提取实体和关系，限制输入长度加快速度"""
+    # 限制输入长度，避免大块文本消耗太多时间
+    text = text[:800]
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": f"""从以下文本中提取实体和关系。
-实体类型：人物、地点、概念、技术、组织
-只提取文本中明确提到的，用简短动词表示关系。
+        messages=[{"role": "user", "content": f"""从文本提取实体和关系，最多5个实体、5条关系。
+只返回JSON，格式：
+{{"entities":[{{"name":"","type":"","description":""}}],
+  "relationships":[{{"source":"","relation":"","target":""}}]}}
 
-文本：{text}
-
-返回 JSON 格式：
-{{"entities": [{{"name": "名称", "type": "类型", "description": "描述"}}],
-  "relationships": [{{"source": "实体A", "relation": "关系", "target": "实体B"}}]}}
-
-只返回 JSON。"""}],
-        temperature=0
+文本：{text}"""}],
+        temperature=0,
+        max_tokens=400,        # 限制输出长度
+        timeout=8              # 8秒超时，超时跳过这块
     )
     raw = response.choices[0].message.content.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+        if raw.startswith("json"): raw = raw[4:]
     return json.loads(raw.strip())
 
 
@@ -258,6 +266,25 @@ def store_graph_data(data: dict, filename: str) -> tuple[int, int]:
 
     conn.commit()
     return e_count, r_count
+    
+@app.delete("/documents/{filename}")
+def delete_document(filename: str):
+    """删除某个文档的所有数据：文本块 + 实体 + 关系"""
+    cur.execute("SELECT COUNT(*) FROM documents WHERE filename = %s", (filename,))
+    count = cur.fetchone()[0]
+    if count == 0:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    cur.execute("DELETE FROM documents WHERE filename = %s", (filename,))
+    cur.execute("DELETE FROM entities WHERE source_filename = %s", (filename,))
+    cur.execute("DELETE FROM relationships WHERE source_filename = %s", (filename,))
+    conn.commit()
+
+    return {
+        "status": "success",
+        "message": f"已删除 {filename}",
+        "deleted_chunks": count
+    }
     
 # ========================
 # API 路由
@@ -395,3 +422,77 @@ def get_graph(entity: str):
         "edges": triples,
         "total": len(triples)
     }
+    
+@app.post("/upload-file")
+async def upload_file(file: UploadFile = File(...)):
+    """接收真实文件（PDF/TXT），保存原文并处理"""
+    filename = file.filename or "unknown"
+    content = await file.read()
+    
+    # 保存原始文件
+    file_path = UPLOAD_DIR / filename
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    # 提取文字
+    if filename.endswith(".pdf"):
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(content))
+        text = ""
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n[第{i+1}页]\n{page_text}"
+    else:
+        text = content.decode("utf-8", errors="ignore")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="无法提取文字内容")
+
+    # 切块 + 向量化 + 图谱（复用现有逻辑）
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, chunk_overlap=100,
+        separators=["\n\n", "\n", "。", "！", "？", " ", ""]
+    )
+    chunks = [c for c in splitter.split_text(text) if c.strip()]
+
+    for chunk in chunks:
+        embedding = get_embedding(chunk)
+        cur.execute(
+            "INSERT INTO documents (content, embedding, filename) VALUES (%s, %s, %s)",
+            (chunk, embedding, filename)
+        )
+    conn.commit()
+
+    e_total, r_total = 0, 0
+    # 只对前 5 块提取图谱，避免大文档等待太长
+    graph_chunks = chunks[:5]
+    for chunk in graph_chunks:
+        try:
+            data = extract_entities_and_relations(chunk, filename)
+            e, r = store_graph_data(data, filename)
+            e_total += e
+            r_total += r
+        except Exception as ex:
+            print(f"图谱提取跳过：{ex}")
+
+    return {
+        "status": "success",
+        "filename": filename,
+        "chunks_stored": len(chunks),
+        "graph_entities": e_total,
+        "graph_relations": r_total,
+        "has_original": True
+    }    
+
+@app.get("/files/{filename}")
+def get_file(filename: str):
+    """返回原始文件供前端预览"""
+    file_path = UPLOAD_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="原始文件不存在")
+    
+    media_type = "application/pdf" if filename.endswith(".pdf") else "text/plain"
+    return FileResponse(path=str(file_path), media_type=media_type)
